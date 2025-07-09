@@ -12,6 +12,10 @@ from tqdm import tqdm
 from openrlhf.models import Actor, get_llm_for_sequence_regression
 from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 from openrlhf.utils.deepspeed import DeepspeedStrategy
+from tracer import tracepoint_module_setup, TracePoint
+
+num_actor_group = 0
+
 
 
 class BaseDistributedActor:
@@ -34,6 +38,10 @@ class BaseDistributedActor:
         # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set, so
         # set local rank to 0 when the flag is not applicable.
         os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0]) if ray_noset_visible_devices() else "0"
+        # print("-"*200)
+        # print(os.environ["LOCAL_RANK"])
+        # print("-"*200)
+        # tracepoint_module_setup()
 
     @staticmethod
     def _get_current_node_ip():
@@ -146,6 +154,9 @@ class ReferenceModelActor(BaseModelActor):
 @ray.remote(num_gpus=1)
 class RewardModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
+        print("-"*50)
+        print(os.getenv("RNAK"))
+        print("-"*50)
         self._setup_distributed(strategy)
         model = get_llm_for_sequence_regression(
             pretrain,
@@ -222,12 +233,13 @@ class RayActorGroup:
         # custom resources, see https://docs.ray.io/en/latest/ray-core/scheduling/resources.html
         self._resources = resources
         self._num_resources_per_node = num_resources_per_node
-
         self._initiate_actors(pg, num_gpus_per_actor)
 
     def _initiate_actors(self, pg, num_gpus_per_actor):
+        tp = TracePoint("init-actor", "1")
+        tp.begin()
         world_size = self._num_nodes * self._num_gpus_per_node
-
+        
         # Use placement group to lock resources for models of same type
         if self._num_gpus_per_node > 1 and pg is None:
             bundles = [{"GPU": 1, "CPU": 1} for _ in range(self._num_nodes * self._num_gpus_per_node)]
@@ -276,6 +288,7 @@ class RayActorGroup:
                         resources=self._resources,
                     ).remote(world_size, rank, master_addr, master_port)
                 self._actor_handlers.append(worker_actor)
+        tp.end()
 
     def async_init_model_from_pretrained(
         self,

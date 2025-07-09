@@ -14,6 +14,7 @@ from openrlhf.trainer.ray.ppo_actor import PolicyModelActor
 from openrlhf.trainer.ray.ppo_critic import CriticModelActor
 from openrlhf.utils import get_strategy
 
+from tracer import tracepoint_module_setup, TracePoint
 
 def train(args):
     # initialize ray if not initialized
@@ -21,33 +22,35 @@ def train(args):
         ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}})
 
     # configure strategy
-    # breakpoint()
+    breakpoint()
     strategy = get_strategy(args)
     strategy.print(args)
 
+    tracepoint_module_setup()
     # init vllm / actor /critic /ref /reward model
     # if colocated, create placement group for actor and ref model explicitly.
     pg = None
-    if args.colocate_actor_ref or args.colocate_all_models:
-        if args.init_kl_coef > 0:
-            assert (
-                args.actor_num_nodes == args.ref_num_nodes
-                and args.actor_num_gpus_per_node == args.ref_num_gpus_per_node
-            ), f"num_nodes and num_gpus_per_node must be the same when colocate actor and ref model."
 
+    tp = TracePoint("define-actor-model","1")
+    tp.begin()
+    actor_model = None
+    if args.pipe_allocate:
         bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.actor_num_nodes * args.actor_num_gpus_per_node)]
         pg = placement_group(bundles, strategy="PACK")
         ray.get(pg.ready())
 
-    actor_model = RayActorGroup(
-        args.actor_num_nodes,
-        args.actor_num_gpus_per_node,
-        PolicyModelActor,
-        pg=pg,
-        num_gpus_per_actor=0.2 if pg else 1,
-        duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
-    )
+        actor_model = RayActorGroup(
+            args.actor_num_nodes,
+            args.actor_num_gpus_per_node,
+            PolicyModelActor,
+            pg=pg,
+            num_gpus_per_actor=1,
+            duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
+        )
+    tp.end()
 
+    tp = TracePoint("define-vllm-engine", "1")
+    tp.begin()
     # init vLLM engine for text generation
     vllm_engines = None
     if args.vllm_num_engines is not None and args.vllm_num_engines > 0:
@@ -67,74 +70,82 @@ def train(args):
         else:
             from openrlhf.trainer.ray.vllm_engine import LLMRayActor
 
-        vllm_engines = create_vllm_engines(
-            args.vllm_num_engines,
-            args.vllm_tensor_parallel_size,
-            args.pretrain,
-            args.seed,
-            args.full_determinism,
-            args.enable_prefix_caching,
-            args.enforce_eager,
-            max_len,
-            pg if args.colocate_all_models and not args.async_train else None,
-            args.vllm_gpu_memory_utilization,
-            args.vllm_enable_sleep,
-            LLMRayActor,
-            args.agent_func_path,
-        )
+        # ref and vllm in same gpu group
+        if args.pipe_allocate:
+            bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.ref_num_nodes * args.ref_num_gpus_per_node)]
+            pg = placement_group(bundles, strategy="PACK")
+            ray.get(pg.ready())
 
+            vllm_engines = create_vllm_engines(
+                args.vllm_num_engines,
+                args.vllm_tensor_parallel_size,
+                args.pretrain,
+                args.seed,
+                args.full_determinism,
+                args.enable_prefix_caching,
+                args.enforce_eager,
+                max_len,
+                pg,
+                args.vllm_gpu_memory_utilization,
+                args.vllm_enable_sleep,
+                LLMRayActor,
+                args.agent_func_path,
+            )
+    tp.end()
+
+    tp = TracePoint("define-ref-model", "1")
+    tp.begin()
+    ref_model = None
     if args.init_kl_coef <= 0:
         ref_model = None
     else:
-        ref_model = RayActorGroup(
-            args.ref_num_nodes,
-            args.ref_num_gpus_per_node,
-            ReferenceModelActor,
-            pg=pg,
-            num_gpus_per_actor=0.2 if pg else 1,
-            duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
-        )
+        if args.pipe_allocate:
+            bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.ref_num_nodes * args.ref_num_gpus_per_node)]
+            pg = placement_group(bundles, strategy="PACK")
+            ray.get(pg.ready())
+            
+            ref_model = RayActorGroup(
+                args.ref_num_nodes,
+                args.ref_num_gpus_per_node,
+                ReferenceModelActor,
+                pg=pg,
+                num_gpus_per_actor=1,
+                duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
+            )
+    tp.end()
 
-    if not args.colocate_all_models:
-        pg = None
+    tp = TracePoint("define-critic-model", "1")
+    tp.begin()
+    critic_model = None
+    if args.pipe_allocate:
+        critic_model = None
+    tp.end()
 
-    # if colocated, create placement group for critic and reward model explicitly.
-    if args.critic_pretrain and args.colocate_critic_reward:
-        assert (
-            args.critic_num_nodes == args.reward_num_nodes
-            and args.critic_num_gpus_per_node == args.reward_num_gpus_per_node
-        ), f"num_nodes and num_gpus_per_node must be the same when colocate critic and reward model."
-
-        bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.critic_num_nodes * args.critic_num_gpus_per_node)]
+    tp = TracePoint("define-reward-model", "1")
+    tp.begin()
+    reward_model = None
+    if args.pipe_allocate:
+        bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.reward_num_nodes * args.reward_num_gpus_per_node)]
         pg = placement_group(bundles, strategy="PACK")
         ray.get(pg.ready())
 
-    if args.critic_pretrain:
-        critic_model = RayActorGroup(
-            args.critic_num_nodes,
-            args.critic_num_gpus_per_node,
-            CriticModelActor,
-            pg=pg,
-            num_gpus_per_actor=0.2 if pg else 1,
-            duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
-        )
-    else:
-        critic_model = None
+        # multiple reward models
+        if not args.remote_rm_url:
+            reward_pretrain = args.reward_pretrain
+            reward_model = RayActorGroup(
+                args.reward_num_nodes,
+                args.reward_num_gpus_per_node,
+                RewardModelActor,
+                pg=pg,
+                num_gpus_per_actor=1,
+                duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
+            )
+        else:
+            reward_model = None
+    tp.end()
 
-    # multiple reward models
-    if not args.remote_rm_url:
-        reward_pretrain = args.reward_pretrain
-        reward_model = RayActorGroup(
-            args.reward_num_nodes,
-            args.reward_num_gpus_per_node,
-            RewardModelActor,
-            pg=pg,
-            num_gpus_per_actor=0.2 if pg else 1,
-            duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
-        )
-    else:
-        reward_model = None
-
+    tp = TracePoint("init-Trainer", "1")
+    tp.begin()
     if args.async_train:
         from openrlhf.trainer.ppo_trainer_async import PPOTrainerAsync as PPOTrainer
     else:
@@ -161,7 +172,10 @@ def train(args):
     )
     # training update steps
     max_steps = ray.get(ppo_trainer.get_max_steps.remote())
+    tp.end()
 
+    tp = TracePoint("init-model-ref-actor-reward", "1")
+    tp.begin()
     # init reference/reward/actor model
     refs = []
     if ref_model is not None:
@@ -170,22 +184,34 @@ def train(args):
     if not args.remote_rm_url:
         refs.extend(reward_model.async_init_model_from_pretrained(strategy, reward_pretrain))
     ray.get(refs)
+    tp.end()
 
+    tp = TracePoint("init-model-critic", "1")
+    tp.begin()
     if args.critic_pretrain:
         # critic scheduler initialization depends on max_step, so we have to init critic after actor
         # TODO: use first reward model as critic model
         refs.extend(critic_model.async_init_model_from_pretrained(strategy, args.critic_pretrain, max_steps))
         ray.get(refs)
+    tp.end()
 
+    tp = TracePoint("fit", "1")
+    tp.begin()
     # train actor and critic model
     ray.get(ppo_trainer.fit.remote())
+    tp.end()
 
+    tp = TracePoint("save-actor-model", "1")
+    tp.begin()
     # save model
     ray.get(actor_model.async_save_model())
+    tp.end()
 
+    tp = TracePoint("save-critic-model", "1")
+    tp.begin()
     if args.critic_pretrain and args.save_value_network:
         ray.get(critic_model.async_save_model())
-
+    tp.end()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -448,6 +474,9 @@ if __name__ == "__main__":
 
     # ModelScope parameters
     parser.add_argument("--use_ms", action="store_true", default=False)
+
+    # If use pipe mode to allocate model, only support grpo now
+    parser.add_argument("--pipe_allocate", action="store_true", default=False, help="Use Pipe Mode in Allocate Model")
 
     args = parser.parse_args()
 

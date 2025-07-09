@@ -7,11 +7,14 @@ from typing import Any, List, Tuple, Union
 
 import ray
 import torch
+import asyncio
 
 from openrlhf.models.utils import compute_approx_kl, compute_reward, masked_mean
 from openrlhf.trainer.ray.launcher import RayActorGroup
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.utils import remove_pad_token, zero_pad_sequences
+
+from tracer import tracepoint_module_setup, TracePoint
 
 logger = init_logger(__name__)
 
@@ -243,25 +246,33 @@ class SamplesGenerator:
         self.prompt_max_len = prompt_max_len
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Experience]:
+    async def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Experience]:
         """
         Generate samples and return in batches.
 
         When not using vllm, we will fallback to the default implementation,
         in which actor will be used to generate samples.
         """
+        tracepoint_module_setup()
         # vLLM wakeup when vllm_enable_sleep
         if self.strategy.args.vllm_enable_sleep:
+            wake_up_tp = TracePoint("wake up vllm", "1")
+            wake_up_tp.begin()
             from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
 
             batch_vllm_engine_call(self.vllm_engines, "wake_up")
-
-        rollout_samples = self._generate_vllm(all_prompts, all_labels, **generate_kwargs)
+            wake_up_tp.end()
+        generate_tp = TracePoint("vllm generate", "1")
+        generate_tp.begin()
+        rollout_samples = await self._generate_vllm(all_prompts, all_labels, **generate_kwargs)
+        generate_tp.end()
 
         # vLLM offload when vllm_enable_sleep
         if self.strategy.args.vllm_enable_sleep:
+            sleep_tp = TracePoint("sleep vllm", "1")
+            sleep_tp.begin()
             batch_vllm_engine_call(self.vllm_engines, "sleep")
-
+            sleep_tp.end()
         return rollout_samples
 
         # tokenizer
@@ -285,7 +296,7 @@ class SamplesGenerator:
         )
         return {k: v.to(device) for k, v in batch.items()}
 
-    def _generate_vllm(self, all_prompts: List[str], all_labels, **kwargs) -> List[Experience]:
+    async def _generate_vllm(self, all_prompts: List[str], all_labels, **kwargs) -> List[Experience]:
         """Generate samples using vLLM engine.
 
         Args:
@@ -297,7 +308,10 @@ class SamplesGenerator:
             List of Experience objects containing generated samples
         """
         from vllm import SamplingParams
-
+        from tracer import tracepoint_module_setup, TracePoint
+        tracepoint_module_setup()
+        tp = TracePoint("pre-processing data", "1")
+        tp.begin()
         llms = self.vllm_engines
         args = self.strategy.args
 
@@ -319,21 +333,31 @@ class SamplesGenerator:
         all_prompts = sum([[prompt] * n_samples_per_prompt for prompt in all_prompts], [])
         all_labels = sum([[label] * n_samples_per_prompt for label in all_labels], [])
         all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
+        tp.end()
 
+        tp = TracePoint("send request to vllm", "1")
+        tp.begin()
         # Distribute requests to engines and collect responses
         refs = []
         batch_size = (len(all_prompt_token_ids) + len(llms) - 1) // len(llms)
         for i, llm in enumerate(llms):
             prompt_token_ids = all_prompt_token_ids[i * batch_size : (i + 1) * batch_size]
             refs.append(llm.add_requests.remote(sampling_params=sampling_params, prompt_token_ids=prompt_token_ids))
-        ray.get(refs)
+        await asyncio.gather(*refs)
+        tp.end()
 
+        tp = TracePoint("get outputs from response", "1")
+        tp.begin()
         # Retrieve and combine results from all outputs
         all_output_refs = []
         for i, llm in enumerate(llms):
             all_output_refs.append(llm.get_responses.remote())
-        all_outputs = sum(ray.get(all_output_refs), [])
+        all_outputs_nested = await asyncio.gather(*all_output_refs)
+        all_outputs = sum(all_outputs_nested, [])
+        tp.end()
 
+        tp = TracePoint("post-processing-data", "1")
+        tp.begin()
         pad_token_id, eos_token_id = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
 
         # Process outputs into Experience objects
@@ -378,11 +402,14 @@ class SamplesGenerator:
                 info=info,
             )
             samples_list.append(rollout_samples)
+        tp.end()
 
         # Get rewards from remote reward models if needed
         # This is required by dynamic sampling
         remote_reward_model = kwargs.get("remote_reward_model", None)
         if remote_reward_model:
+            tp = TracePoint("get-remote-reward-model-output", "1")
+            tp.begin()
             all_queries = sum(
                 [
                     self.tokenizer.batch_decode(
@@ -399,7 +426,7 @@ class SamplesGenerator:
             rewards_info = ray.get(remote_reward_model.get_rewards.remote(all_queries, all_prompts, all_labels))
             # Process rewards and scores
             update_samples_with_rewards(rewards_info, samples_list)
-
+            tp.end()
         return samples_list
 
 
@@ -433,7 +460,7 @@ class RemoteExperienceMaker(ABC):
         self.tokenizer = tokenizer
 
     @torch.no_grad()
-    def make_experience_batch(self, rollout_samples) -> List[Experience]:
+    async def make_experience_batch(self, rollout_samples) -> List[Experience]:
         """
         Make a list of experience with the micro_rollout_batch_size.
 
@@ -444,6 +471,10 @@ class RemoteExperienceMaker(ABC):
         # Concat the samples into micro_rollout_batch_size
         # Each batch of samples will be scheduled to a effective Ray Actor (i.e, a DP rank)
         # TODO: balance the number of tokens of each batch for better performance
+        from tracer import TracePoint, tracepoint_module_setup
+        tracepoint_module_setup()
+        tp = TracePoint("pre-processing-data", "1")
+        tp.begin()
         samples_list = []
         batch_size = self.args.micro_rollout_batch_size
         for i in range(0, len(rollout_samples), batch_size):
@@ -451,19 +482,25 @@ class RemoteExperienceMaker(ABC):
                 rollout_samples[i : i + batch_size], self.tokenizer.pad_token_id
             )
             samples_list.append(concat_samples)
+        tp.end()
 
+        tp = TracePoint("actor-critic-reward-ref-forward", "1")
+        tp.begin()
         # Make experiences (models forward: logprobs, values, rewards, and kl divergence)
-        experiences = self.make_experience(samples_list)
+        experiences = await self.make_experience(samples_list)
+        tp.end()
 
         # Process experiences (reward shaping, etc.)
         experiences = self.compute_advantages_and_returns(experiences)
         return experiences
 
     @torch.no_grad()
-    def make_experience(self, samples_list: List[Experience]) -> List[Experience]:
+    async def make_experience(self, samples_list: List[Experience]) -> List[Experience]:
         """
         Turn samples into experience by calculating logprobs, values, rewards, and kl divergence.
         """
+        from tracer import TracePoint, tracepoint_module_setup
+        tracepoint_module_setup()
         start_time = time.time()
         logger.info(f"🚀 Starting experience making with {len(samples_list[0].sequences) * len(samples_list)} samples")
 
@@ -502,8 +539,9 @@ class RemoteExperienceMaker(ABC):
 
         # Sync to avoid GPU OOM when colocate models
         if args.colocate_all_models and not self.remote_rm_url:
-            ray.get(r_refs)
-            ray.get(self.reward_model_group.async_run_method(method_name="empty_cache"))
+            await asyncio.gather(*r_refs)
+            reward_empty_cache_refs = self.reward_model_group.async_run_method(method_name="empty_cache")
+            await asyncio.gather(*reward_empty_cache_refs)
 
         # Batch call actor model
         action_log_probs_ref = self.actor_model_group.async_run_method_batch(
@@ -515,14 +553,16 @@ class RemoteExperienceMaker(ABC):
 
         # Sync to avoid GPU OOM when colocate models
         if args.colocate_all_models or args.colocate_actor_ref:
-            ray.get(action_log_probs_ref)
-            ray.get(self.actor_model_group.async_run_method(method_name="empty_cache"))
+            await asyncio.gether(*action_log_probs_ref)
+            actor_empty_cache_refs = self.actor_model_group.async_run_method(method_name="empty_cache")
+            await asyncio.gather(*actor_empty_cache_refs)
 
         # Batch call critic model
         if self.critic_model_group is not None:
             if args.colocate_critic_reward and not self.remote_rm_url:
-                ray.get(r_refs)
-                ray.get(self.reward_model_group.async_run_method(method_name="empty_cache"))
+                await asyncio.gather(*r_refs)
+                reward_empty_cache_refs = self.reward_model_group.async_run_method(method_name="empty_cache")
+                await asyncio.gather(*reward_empty_cache_refs)
 
             value_ref = self.critic_model_group.async_run_method_batch(
                 method_name="forward",
@@ -531,8 +571,9 @@ class RemoteExperienceMaker(ABC):
                 attention_mask=attention_mask_list,
             )
             if args.colocate_all_models or args.colocate_critic_reward:
-                ray.get(value_ref)
-                ray.get(self.critic_model_group.async_run_method(method_name="empty_cache"))
+                await asyncio.gather(*value_ref)
+                critic_empty_cache_refs = self.critic_model_group.async_run_method(method_name="empty_cache")
+                await asyncio.gather(*critic_empty_cache_refs)
         else:
             value_ref = ray.put([[None]] * (len(samples_list) * args.ring_attn_size * args.ds_tensor_parallel_size))
 
@@ -546,8 +587,9 @@ class RemoteExperienceMaker(ABC):
             )
 
             if args.colocate_all_models or args.colocate_actor_ref:
-                ray.get(base_action_log_probs_ref)
-                ray.get(self.initial_model_group.async_run_method(method_name="empty_cache"))
+                await asyncio.gather(*base_action_log_probs_ref)
+                ref_empty_cache_refs = self.initial_model_group.async_run_method(method_name="empty_cache")
+                await asyncio.gather(ref_empty_cache_refs)
         else:
             base_action_log_probs_ref = ray.put(
                 [[None]] * (len(samples_list) * args.ring_attn_size * args.ds_tensor_parallel_size)
@@ -557,21 +599,26 @@ class RemoteExperienceMaker(ABC):
         # Note: the results duplicated ring_attn_size * ds_tensor_parallel_size times
         # This is because the actors in ring group and tp group will return the same output
         duplicate_factor = args.ring_attn_size * args.ds_tensor_parallel_size
-        action_log_probs_list = sum(ray.get(action_log_probs_ref)[::duplicate_factor], [])
-        base_action_log_probs_list = sum(ray.get(base_action_log_probs_ref)[::duplicate_factor], [])
-        value_list = sum(ray.get(value_ref)[::duplicate_factor], [])
+        action_log_probs_result = await asyncio.gather(*action_log_probs_ref)
+        base_action_log_probs_result = await asyncio.gather(*base_action_log_probs_ref)
+        value_result = await value_ref
+
+        action_log_probs_list = sum(action_log_probs_result[::duplicate_factor], [])
+        base_action_log_probs_list = sum(base_action_log_probs_result[::duplicate_factor], [])
+        value_list = sum(value_result[::duplicate_factor], [])
 
         # Process rewards based on source
         if samples_list[0].rewards is not None:
             pass
         elif self.remote_rm_url:
             # Get rewards info from remote model
-            rewards_info = ray.get(r_refs)
+            rewards_info = await asyncio.gather(*r_refs)
             # Process rewards and scores
             update_samples_with_rewards(rewards_info, samples_list)
         else:
             # Reward Model
-            rewards_list = sum(ray.get(r_refs)[::duplicate_factor], [])
+            rewards_result = await asyncio.gather(*r_refs)
+            rewards_list = sum(rewards_result[::duplicate_factor], [])
             for i, samples in enumerate(samples_list):
                 samples.rewards = rewards_list[i]
                 samples.info["reward"] = rewards_list[i]

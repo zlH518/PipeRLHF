@@ -6,6 +6,7 @@ from datetime import timedelta
 import ray
 import torch
 from tqdm import tqdm
+import asyncio
 
 from openrlhf.datasets import PromptDataset
 from openrlhf.datasets.utils import blending_datasets
@@ -15,6 +16,8 @@ from openrlhf.trainer.ray.launcher import RayActorGroup
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.utils import get_tokenizer
+
+from tracer import TracePoint, tracepoint_module_setup
 
 logger = init_logger(__name__)
 
@@ -115,55 +118,58 @@ class BasePPOTrainer(ABC):
     def fit(self):
         raise NotImplementedError("fit method is not implemented")
 
-    def ppo_train(self, global_steps):
+
+    async def ppo_train(self, global_steps):
         status = {}
 
         # triger remote critic model training
         if self.critic_model_group is not None:
             # sync for deepspeed_enable_sleep
             if self.strategy.args.deepspeed_enable_sleep:
-                ray.get(self.critic_model_group.async_run_method(method_name="reload_states"))
+                await asyncio.gather(*self.critic_model_group.async_run_method(method_name="reload_states"))
 
             critic_status_ref = self.critic_model_group.async_run_method(method_name="fit")
 
             if self.strategy.args.colocate_all_models or self.strategy.args.deepspeed_enable_sleep:
-                status.update(ray.get(critic_status_ref)[0])
+                critic_status = await asyncio.gather(*critic_status_ref)
+                status.update(critic_status[0][0])
             if self.strategy.args.deepspeed_enable_sleep:
-                ray.get(self.critic_model_group.async_run_method(method_name="offload_states"))
+                await asyncio.gather(*self.critic_model_group.async_run_method(method_name="offload_states"))
 
         # actor model training
         if global_steps > self.freezing_actor_steps:
             if self.strategy.args.deepspeed_enable_sleep:
-                self.actor_model_group.async_run_method(method_name="reload_states")
+                await asyncio.gather(*self.actor_model_group.async_run_method(method_name="reload_states"))
 
             actor_status_ref = self.actor_model_group.async_run_method(method_name="fit", kl_ctl=self.kl_ctl.value)
-            status.update(ray.get(actor_status_ref)[0])
+            actor_status = await asyncio.gather(*actor_status_ref)
+            status.update(actor_status[0])
 
             if self.strategy.args.deepspeed_enable_sleep:
-                self.actor_model_group.async_run_method(method_name="offload_states")
+                await asyncio.gather(*self.actor_model_group.async_run_method(method_name="offload_states"))
 
             # 4. broadcast weights to vllm engines
             if self.vllm_engines is not None:
-                self._broadcast_to_vllm()
+                await self._broadcast_to_vllm()
 
         # 5. wait remote critic model training done
         if self.critic_model_group and not self.strategy.args.colocate_all_models:
-            status.update(ray.get(critic_status_ref)[0])
+            critic_status = await asyncio.gather(*critic_status_ref)
+            status.update(critic_status[0])
 
         return status
 
-    def _broadcast_to_vllm(self):
+    async def _broadcast_to_vllm(self):
         if self.strategy.args.vllm_enable_sleep:
             from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
-
             batch_vllm_engine_call(self.vllm_engines, "wake_up")
 
-        ray.get(self.actor_model_group.async_run_method(method_name="broadcast_to_vllm"))
+        await asyncio.gather(*self.actor_model_group.async_run_method(method_name="broadcast_to_vllm"))
 
         if self.strategy.args.vllm_enable_sleep:
             batch_vllm_engine_call(self.vllm_engines, "sleep")
 
-    def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
+    async def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
         if global_step % args.logging_steps == 0:
             # wandb
             if self._wandb is not None:
@@ -207,7 +213,7 @@ class BasePPOTrainer(ABC):
             )
             if self.critic_model_group is not None:
                 ref.extend(self.critic_model_group.async_run_method(method_name="save_checkpoint", tag=tag))
-            ray.get(ref)
+            await asyncio.gather(*ref)
 
     def evaluate(self, eval_dataloader, global_step, temperature=0.6, n_samples_per_prompt=1):
         """Evaluate model performance on eval dataset.
@@ -424,118 +430,157 @@ class PPOTrainer(BasePPOTrainer):
         self.prepare_datasets()
         self._init_wandb()
 
+        self.load_ckpt_lock = asyncio.Lock()
+        self.rollout_lock = asyncio.Lock()
+        self.make_experiences_lock = asyncio.Lock()
+        self.train_actor_critic_lock = asyncio.Lock()
+        self.save_train_info_lock = asyncio.Lock()
+        self.ppo_train_lock = asyncio.Lock()
+        self.loop = asyncio.get_event_loop()
+
         # get eval and save steps
         if self.args.eval_steps == -1:
             self.args.eval_steps = float("inf")  # do not evaluate
         if self.args.save_steps == -1:
             self.args.save_steps = float("inf")  # do not save ckpt
 
-    def fit(
-        self,
-    ) -> None:
+    async def load_ckpt(self, task_id):
+        async with self.load_ckpt_lock:
+            args = self.args
+            tracepoint_module_setup()
+
+            tp = TracePoint(f"load-ckpt-{task_id}", "1")
+            tp.begin()
+            # broadcast init checkpoint to vllm
+            ckpt_path = os.path.join(args.ckpt_path, "_actor")
+            if args.load_checkpoint and os.path.exists(ckpt_path):
+                checkpoint_states = (await self.actor_model_group.async_run_method(method_name="get_checkpoint_states"))[0]
+                print(checkpoint_states)
+                logger.info(f"checkpoint_states: {checkpoint_states}")
+                await self._broadcast_to_vllm()
+            else:
+                checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}}
+
+            # Restore step and start_epoch
+            steps = checkpoint_states["global_step"] + 1
+            episode = checkpoint_states["episode"]
+            data_loader_state_dict = checkpoint_states["data_loader_state_dict"]
+            if data_loader_state_dict:
+                self.prompts_dataloader.load_state_dict(data_loader_state_dict)
+            tp.end()
+            return steps
+
+    async def rollout(self, rand_prompts, labels, number_of_samples, task_id):
+        async with self.rollout_lock:
+            number_of_samples_tp = TracePoint(f"number of samples:{number_of_samples}", "1")
+            number_of_samples_tp.begin()
+            remote_reward_model = self.remote_reward_model if self.args.dynamic_filtering else None
+            rollout_samples_tp = TracePoint(f"rollout-samples-{task_id}", "1")
+            rollout_samples_tp.begin()
+            rollout_samples = await self.samples_generator.generate_samples(
+                rand_prompts, labels, remote_reward_model=remote_reward_model, **self.generate_kwargs
+            )
+            rollout_samples_tp.end()
+            number_of_samples_tp.end()
+            return rollout_samples
+    
+    async def make_experiences(self, rollout_samples, task_id):
+        async with self.make_experiences_lock:
+            experiences_tp = TracePoint(f"make_experiences-{task_id}", "1")
+            experiences_tp.begin()
+            experiences = await self.experience_maker.make_experience_batch(rollout_samples)
+            experiences_tp.end()
+
+            sample0 = self.tokenizer.batch_decode(
+                experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True
+            )
+            print(sample0)
+            save_experiences_tp = TracePoint(f"save-experiences-actor-critic-{task_id}", "1")
+            save_experiences_tp.begin()
+            refs = self.actor_model_group.async_run_method_batch(method_name="append", experience=experiences)
+            if self.critic_model_group is not None:
+                refs.extend(
+                    self.critic_model_group.async_run_method_batch(method_name="append", experience=experiences)
+                )
+            await asyncio.gather(*refs)
+            save_experiences_tp.end()
+            return sample0, experiences
+    
+    async def train_actor_critic(self, steps, task_id):
+        async with self.train_actor_critic_lock:
+            train_tp = TracePoint(f"train-actor-critic-{task_id}", "1")
+            train_tp.begin()
+            status = await self.ppo_train(steps)
+            train_tp.end()
+            return status
+    
+    async def save_train_info(self, status, args, pbar, steps, sample0, experiences, episode, task_id):
+        async with self.save_train_info_lock:
+            save_info_tp = TracePoint(f"save_train_info-{task_id}", "1")
+            save_info_tp.begin()
+            if "kl" in status:
+                self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
+
+            logger.info(f"✨ Global step {steps}: {status}")
+            status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
+
+            # logs/checkpoints
+            client_states = {
+                "global_step": steps,
+                "episode": episode,
+                "data_loader_state_dict": self.prompts_dataloader.state_dict(),
+            }
+            await self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
+            save_info_tp.end()
+
+    async def _run_single_task(self, task_id: int):
         args = self.args
+        print(f"Task {task_id}: Starting...")
 
-        # broadcast init checkpoint to vllm
-        ckpt_path = os.path.join(args.ckpt_path, "_actor")
-        if args.load_checkpoint and os.path.exists(ckpt_path):
-            checkpoint_states = ray.get(self.actor_model_group.async_run_method(method_name="get_checkpoint_states"))[
-                0
-            ]
-            logger.info(f"checkpoint_states: {checkpoint_states}")
-            self._broadcast_to_vllm()
-        else:
-            checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}}
+        steps = await self.load_ckpt(task_id)
+        print(f"Task {task_id}: Initial steps: {steps}")
 
-        # Restore step and start_epoch
-        steps = checkpoint_states["global_step"] + 1
-        episode = checkpoint_states["episode"]
-        data_loader_state_dict = checkpoint_states["data_loader_state_dict"]
-        if data_loader_state_dict:
-            self.prompts_dataloader.load_state_dict(data_loader_state_dict)
-
-        for episode in range(episode, args.num_episodes):
+        for episode in range(0, args.num_episodes):
             pbar = tqdm(
                 range(self.prompts_dataloader.__len__()),
-                desc=f"Episode [{episode + 1}/{args.num_episodes}]",
+                desc=f"Task {task_id} Episode [{episode + 1}/{args.num_episodes}]",
                 disable=False,
+                leave=False
             )
 
-            filtered_samples = []
             number_of_samples = 0
-            for _, rand_prompts, labels in self.prompts_dataloader:
-                remote_reward_model = self.remote_reward_model if self.args.dynamic_filtering else None
-                rollout_samples = self.samples_generator.generate_samples(
-                    rand_prompts, labels, remote_reward_model=remote_reward_model, **self.generate_kwargs
-                )
+            for _, rand_prompts, labels in self.prompts_dataloader: 
+                if number_of_samples > 1:
+                    break
+
+                rollout_samples = await self.rollout(rand_prompts, labels, number_of_samples, task_id)
                 pbar.update()
 
-                # dynamic filtering
-                pass_rate = None
-                if self.args.dynamic_filtering:
-                    number_of_samples += len(rollout_samples)
-                    # Group individual samples into batches of n_samples size
-                    for i in range(0, len(rollout_samples), self.args.n_samples_per_prompt):
-                        batch_samples = rollout_samples[i : i + self.args.n_samples_per_prompt]
-                        if len(batch_samples) < self.args.n_samples_per_prompt:
-                            continue
+                sample0, experiences = await self.make_experiences(rollout_samples, task_id)
+                status = await self.train_actor_critic(steps, task_id)
+                await self.save_train_info(status=status, args=args, pbar=pbar, steps=steps, sample0=sample0, experiences=experiences, episode=episode, task_id=task_id)
 
-                        # Calculate average reward for this batch of samples
-                        avg_reward = sum(sample.scores[0].item() for sample in batch_samples) / len(batch_samples)
+                steps += 1
+                number_of_samples += 1
 
-                        # Check if average reward is within the specified range
-                        min_reward, max_reward = self.args.dynamic_filtering_reward_range
-                        if min_reward + 1e-6 < avg_reward < max_reward - 1e-6:
-                            filtered_samples.extend(batch_samples)
+            pbar.close()
+            print(f"Task {task_id}: Episode {episode + 1} finished, current steps: {steps}")
 
-                    # Continue sampling if filtered samples are insufficient
-                    if len(filtered_samples) / self.args.n_samples_per_prompt < self.args.rollout_batch_size:
-                        logger.info(
-                            f"filtered_samples {len(filtered_samples) / self.args.n_samples_per_prompt} < rollout_batch_size {self.args.rollout_batch_size}, continue sampling"
-                        )
-                        continue
+        print(f"Task {task_id}: All episodes completed.")
 
-                    pass_rate = len(filtered_samples) / number_of_samples * 100
-                    logger.info(
-                        f"Dynamic filtering pass rate: {pass_rate:.2f}% ({len(filtered_samples)}/{number_of_samples})"
-                    )
-                    rollout_samples = filtered_samples[: self.args.rollout_batch_size * self.args.n_samples_per_prompt]
-                    filtered_samples = []
-                    number_of_samples = 0
 
-                experiences = self.experience_maker.make_experience_batch(rollout_samples)
-                sample0 = self.tokenizer.batch_decode(
-                    experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True
-                )
-                print(sample0)
-                refs = self.actor_model_group.async_run_method_batch(method_name="append", experience=experiences)
-                if self.critic_model_group is not None:
-                    refs.extend(
-                        self.critic_model_group.async_run_method_batch(method_name="append", experience=experiences)
-                    )
-                ray.get(refs)
+    async def fit(self) -> None:
+        args = self.args
+        print("Starting concurrent training tasks...")
 
-                status = self.ppo_train(steps)
-
-                if "kl" in status:
-                    self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
-
-                # Add generated samples to status dictionary
-                if self.args.dynamic_filtering:
-                    status["dynamic_filtering_pass_rate"] = pass_rate
-                logger.info(f"✨ Global step {steps}: {status}")
-                status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
-
-                # logs/checkpoints
-                client_states = {
-                    "global_step": steps,
-                    "episode": episode,
-                    "data_loader_state_dict": self.prompts_dataloader.state_dict(),
-                }
-                self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
-
-                steps = steps + 1
+        await asyncio.gather(
+            self._run_single_task(1),
+            self._run_single_task(2)
+        )
 
         if self._wandb is not None:
             self._wandb.finish()
         if self._tensorboard is not None:
             self._tensorboard.close()
+
+        print("All concurrent training tasks finished.")
