@@ -1,0 +1,56 @@
+1752001370077907,-1,0,1,load-ckpt-1,B
+1752001370078111,-1,0,1,load-ckpt-1,E
+1752001370080778,-1,0,1,number of samples:0,B
+1752001370080859,-1,0,1,rollout-samples-1,B
+1752001370081005,-1,0,1,vllm generate,B
+1752001374304580,-1,0,1,pre-processing data,B
+1752001374311058,-1,0,1,pre-processing data,E
+1752001374311136,-1,0,1,send request to vllm,B
+1752001407071218,-1,0,1,send request to vllm,E
+1752001407071429,-1,0,1,get outputs from response,B
+1752001407076173,-1,0,1,get outputs from response,E
+1752001407076321,-1,0,1,post-processing-data,B
+1752001407083727,-1,0,1,post-processing-data,E
+1752001407084258,-1,0,1,vllm generate,E
+1752001407084550,-1,0,1,rollout-samples-1,E
+1752001407084656,-1,0,1,number of samples:0,E
+1752001407085393,-1,0,1,make_experiences-1,B
+1752001407085682,-1,0,1,pre-processing-data,B
+1752001407088117,-1,0,1,pre-processing-data,E
+1752001407088249,-1,0,1,actor-critic-reward-ref-forward,B
+1752001409536900,-1,0,1,actor-critic-reward-ref-forward,E
+1752001409597249,-1,0,1,make_experiences-1,E
+1752001409598981,-1,0,1,save-experiences-actor-critic-1,B
+1752001409612386,-1,0,1,save-experiences-actor-critic-1,E
+1752001409612567,-1,0,1,train-actor-critic-1,B
+1752001425159036,-1,0,1,train-actor-critic-1,E
+1752001425159338,-1,0,1,save_train_info-1,B
+1752001425161538,-1,0,1,save_train_info-1,E
+1752001425163436,-1,0,1,load-ckpt-2,B
+1752001425163566,-1,0,1,load-ckpt-2,E
+1752001425165433,-1,0,1,number of samples:0,B
+1752001425165535,-1,0,1,rollout-samples-2,B
+1752001425165685,-1,0,1,vllm generate,B
+1752001425165808,-1,0,1,pre-processing data,B
+1752001425167374,-1,0,1,pre-processing data,E
+1752001425167472,-1,0,1,send request to vllm,B
+1752001441601644,-1,0,1,send request to vllm,E
+1752001441601804,-1,0,1,get outputs from response,B
+1752001441604484,-1,0,1,get outputs from response,E
+1752001441604587,-1,0,1,post-processing-data,B
+1752001441607291,-1,0,1,post-processing-data,E
+1752001441607514,-1,0,1,vllm generate,E
+1752001441607595,-1,0,1,rollout-samples-2,E
+1752001441607643,-1,0,1,number of samples:0,E
+1752001441608005,-1,0,1,make_experiences-2,B
+1752001441608094,-1,0,1,pre-processing-data,B
+1752001441609301,-1,0,1,pre-processing-data,E
+1752001441609389,-1,0,1,actor-critic-reward-ref-forward,B
+1752001443917449,-1,0,1,actor-critic-reward-ref-forward,E
+1752001443958413,-1,0,1,make_experiences-2,E
+1752001443959362,-1,0,1,save-experiences-actor-critic-2,B
+1752001443974788,-1,0,1,save-experiences-actor-critic-2,E
+1752001443974953,-1,0,1,train-actor-critic-2,B
+1752001450095374,-1,0,1,train-actor-critic-2,E
+1752001450095578,-1,0,1,save_train_info-2,B
+1752001450096213,-1,0,1,save_train_info-2,E
