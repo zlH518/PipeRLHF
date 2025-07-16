@@ -19,7 +19,7 @@ num_actor_group = 0
 
 
 class BaseDistributedActor:
-    def __init__(self, world_size, rank, master_addr, master_port):
+    def __init__(self, world_size, rank, master_addr, master_port, global_rank):
         logging.basicConfig(
             format="%(asctime)s %(levelname)-8s %(message)s",
             level=logging.INFO,
@@ -38,10 +38,13 @@ class BaseDistributedActor:
         # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set, so
         # set local rank to 0 when the flag is not applicable.
         os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0]) if ray_noset_visible_devices() else "0"
-        # print("-"*200)
-        # print(os.environ["LOCAL_RANK"])
-        # print("-"*200)
-        # tracepoint_module_setup()
+
+        print("88"*100)
+        os.environ["GLOBAL_RANK"] = str(global_rank)
+        print(os.getenv("GLOBAL_RANK"))
+        print("88"*100)
+        # breakpoint()
+        tracepoint_module_setup()
 
     @staticmethod
     def _get_current_node_ip():
@@ -113,6 +116,9 @@ class BaseModelActor(BaseDistributedActor):
 class ReferenceModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
         self._setup_distributed(strategy)
+        print("88"*100)
+        print(f"ref model global rank: {os.getenv("GLOBAL_RANK")}")
+        print("88"*100)
         model = Actor(
             pretrain,
             use_flash_attention_2=strategy.args.flash_attn,
@@ -130,6 +136,7 @@ class ReferenceModelActor(BaseModelActor):
 
         self.model = self.strategy.prepare(model, is_rlhf=True)
         self.model.eval()
+        tracepoint_module_setup()
 
     def forward(
         self,
@@ -139,6 +146,8 @@ class ReferenceModelActor(BaseModelActor):
         return_output=False,
         packed_seq_lens: Optional[list[int]] = None,
     ) -> torch.Tensor:
+        tp = TracePoint("ref-forward", "1")
+        tp.begin()
         device = torch.cuda.current_device()
         with torch.no_grad():
             log_probs = self.model(
@@ -148,16 +157,17 @@ class ReferenceModelActor(BaseModelActor):
                 ring_attn_group=self.strategy.ring_attn_group,
                 packed_seq_lens=packed_seq_lens,
             )
+        tp.end()
         return log_probs.to("cpu")
 
 
 @ray.remote(num_gpus=1)
 class RewardModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
-        print("-"*50)
-        print(os.getenv("RNAK"))
-        print("-"*50)
         self._setup_distributed(strategy)
+        print("88"*100)
+        print(f"reward model global rank: {os.getenv("GLOBAL_RANK")}")
+        print("88"*100)
         model = get_llm_for_sequence_regression(
             pretrain,
             "reward",
@@ -178,6 +188,7 @@ class RewardModelActor(BaseModelActor):
 
         self.model = self.strategy.prepare(model, is_rlhf=True)
         self.model.eval()
+        tracepoint_module_setup()
 
     def forward(
         self,
@@ -186,6 +197,8 @@ class RewardModelActor(BaseModelActor):
         packed_seq_lens=None,
         pad_sequence=False,
     ) -> torch.Tensor:
+        tp = TracePoint("reward-forward", "1")
+        tp.begin()
         device = torch.cuda.current_device()
         with torch.no_grad():
             reward = self.model(
@@ -195,6 +208,7 @@ class RewardModelActor(BaseModelActor):
                 pad_sequence=True,
                 packed_seq_lens=packed_seq_lens,
             )
+        tp.end()
         return reward.to("cpu")
 
 
@@ -223,7 +237,9 @@ class RayActorGroup:
         duplicate_actors: int = 1,
         resources: Dict[str, float] = None,
         num_resources_per_node: int = None,
+        offset: int = None
     ) -> None:
+        self.offset = offset
         self._num_nodes = num_nodes
         self._num_gpus_per_node = num_gpus_per_node
         self.ray_actor_type = ray_actor_type
@@ -233,6 +249,7 @@ class RayActorGroup:
         # custom resources, see https://docs.ray.io/en/latest/ray-core/scheduling/resources.html
         self._resources = resources
         self._num_resources_per_node = num_resources_per_node
+        tracepoint_module_setup()
         self._initiate_actors(pg, num_gpus_per_actor)
 
     def _initiate_actors(self, pg, num_gpus_per_actor):
@@ -258,13 +275,13 @@ class RayActorGroup:
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg, placement_group_bundle_index=0
                 ),
-            ).remote(world_size, 0, None, None)
+            ).remote(world_size, 0, None, None, self.offset)
         else:
             master_actor = self.ray_actor_type.options(
                 num_cpus=num_gpus_per_actor,
                 num_gpus=num_gpus_per_actor,
                 resources=self._resources,
-            ).remote(world_size, 0, None, None)
+            ).remote(world_size, 0, None, None, self.offset)
         self._actor_handlers = [master_actor]
 
         # Create worker_actor
@@ -280,13 +297,13 @@ class RayActorGroup:
                             placement_group=pg,
                             placement_group_bundle_index=rank,
                         ),
-                    ).remote(world_size, rank, master_addr, master_port)
+                    ).remote(world_size, rank, master_addr, master_port, self.offset+rank)
                 else:
                     worker_actor = self.ray_actor_type.options(
                         num_cpus=num_gpus_per_actor,
                         num_gpus=num_gpus_per_actor,
                         resources=self._resources,
-                    ).remote(world_size, rank, master_addr, master_port)
+                    ).remote(world_size, rank, master_addr, master_port, self.offset)
                 self._actor_handlers.append(worker_actor)
         tp.end()
 

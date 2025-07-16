@@ -80,6 +80,7 @@ class BasePPOTrainer(ABC):
             from openrlhf.trainer.ppo_utils.experience_maker import SamplesGenerator
 
         self.generator_cls = SamplesGenerator
+        os.environ["GLOBAL_RANK"] = str(0)
 
     def _init_wandb(self):
         # wandb/tensorboard setting
@@ -550,8 +551,6 @@ class PPOTrainer(BasePPOTrainer):
 
             number_of_samples = 0
             for _, rand_prompts, labels in self.prompts_dataloader: 
-                if number_of_samples > 1:
-                    break
 
                 rollout_samples = await self.rollout(rand_prompts, labels, number_of_samples, task_id)
                 pbar.update()

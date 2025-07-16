@@ -10,6 +10,8 @@ from openrlhf.utils.logging_utils import init_logger
 
 from .utils import get_bundle_indices, ray_noset_visible_devices
 
+from tracer import tracepoint_module_setup, TracePoint
+
 logger = init_logger(__name__)
 
 
@@ -36,7 +38,7 @@ class BaseLLMRayActor:
             # when the distributed_executor_backend is not ray and
             # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set.
             os.environ["CUDA_VISIBLE_DEVICES"] = str(ray.get_gpu_ids()[0])
-
+        os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
         num_gpus = kwargs.pop("num_gpus")
         if bundle_indices is not None:
             os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
@@ -58,6 +60,8 @@ class BaseLLMRayActor:
 
         if vllm.__version__ >= "0.9.0":
             os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+        os.environ["GLOBAL_RANK"] = str(kwargs.pop("offset"))
+        tracepoint_module_setup()
 
 
 @ray.remote
@@ -95,18 +99,24 @@ class LLMRayActor(BaseLLMRayActor):
         Process requests from rank0 and generate responses.
         Since only rank0 will send requests, we don't need to track actor ranks.
         """
+        tp = TracePoint("put-request-in-queue", "1")
+        tp.begin()
         from vllm.inputs import TokensPrompt
 
         requests = [TokensPrompt(prompt_token_ids=r) for r in prompt_token_ids]
         responses = self.llm.generate(prompts=requests, sampling_params=sampling_params)
         self.response_queues.put(responses)
+        tp.end()
 
     def get_responses(self):
         """
         Return the responses for the actor with the given rank
         """
-        return self.response_queues.get()
-
+        tp = TracePoint("get-responses", "1")
+        tp.begin()
+        ans = self.response_queues.get()
+        tp.end()
+        return ans
 
 def create_vllm_engines(
     num_engines: int,
@@ -122,6 +132,7 @@ def create_vllm_engines(
     vllm_enable_sleep=False,
     llm_actor_cls=LLMRayActor,
     agent_func_path=None,
+    offset: int =None
 ):
     import vllm
 
@@ -175,6 +186,7 @@ def create_vllm_engines(
                 num_gpus=0.2 if use_hybrid_engine else 1,
                 enable_sleep_mode=vllm_enable_sleep,
                 agent_func_path=agent_func_path,
+                offset=offset,
             )
         )
 

@@ -1,6 +1,7 @@
 import argparse
 from datetime import datetime
 
+import os
 import ray
 from ray.util.placement_group import placement_group
 
@@ -14,16 +15,27 @@ from openrlhf.trainer.ray.ppo_actor import PolicyModelActor
 from openrlhf.trainer.ray.ppo_critic import CriticModelActor
 from openrlhf.utils import get_strategy
 
+from tracer import tracepoint_module_setup, TracePoint
+
 
 def train(args):
     # initialize ray if not initialized
     if not ray.is_initialized():
+        print("--"*50)
+        # ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "RAY_DEBUG_POST_MORTEM": "1"}})
         ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}})
-
     # configure strategy
     # breakpoint()
+    tracepoint_module_setup()
     strategy = get_strategy(args)
     strategy.print(args)
+    offset:dict = {
+        "actor": 0,
+        "vllm": 1,
+        "critic": None,
+        "ref": 2,
+        "reward": 3
+    }
 
     # init vllm / actor /critic /ref /reward model
     # if colocated, create placement group for actor and ref model explicitly.
@@ -46,6 +58,7 @@ def train(args):
         pg=pg,
         num_gpus_per_actor=0.2 if pg else 1,
         duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
+        offset = offset["actor"]
     )
 
     # init vLLM engine for text generation
@@ -81,6 +94,7 @@ def train(args):
             args.vllm_enable_sleep,
             LLMRayActor,
             args.agent_func_path,
+            offset=offset["vllm"]
         )
 
     if args.init_kl_coef <= 0:
@@ -93,6 +107,7 @@ def train(args):
             pg=pg,
             num_gpus_per_actor=0.2 if pg else 1,
             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
+            offset=offset["ref"]
         )
 
     if not args.colocate_all_models:
@@ -117,6 +132,7 @@ def train(args):
             pg=pg,
             num_gpus_per_actor=0.2 if pg else 1,
             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
+            offset=offset["critic"]
         )
     else:
         critic_model = None
@@ -131,6 +147,7 @@ def train(args):
             pg=pg,
             num_gpus_per_actor=0.2 if pg else 1,
             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
+            offset=offset["reward"]
         )
     else:
         reward_model = None
@@ -538,5 +555,4 @@ if __name__ == "__main__":
 
         # Patch hub to download models from modelscope to speed up.
         patch_hub()
-
     train(args)

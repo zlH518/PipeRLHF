@@ -17,6 +17,8 @@ from openrlhf.utils import get_tokenizer
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, reload_deepspeed_states
 
+from tracer import tracepoint_module_setup, TracePoint
+
 from ..ppo_utils import NaiveReplayBuffer
 from .launcher import BaseModelActor
 
@@ -148,6 +150,9 @@ class CriticModelActor(BaseModelActor):
         args = strategy.args
 
         self._setup_distributed(strategy)
+        print("88"*100)
+        print(f"critic model global rank: {os.getenv("GLOBAL_RANK")}")
+        print("88"*100)
         critic = get_llm_for_sequence_regression(
             pretrain,
             "critic",
@@ -227,6 +232,8 @@ class CriticModelActor(BaseModelActor):
         packed_seq_lens=None,
     ) -> torch.Tensor:
         """Generates critic values."""
+        tp = TracePoint("critic-forward", "1")
+        tp.begin()
         device = torch.cuda.current_device()
         self.critic.eval()
         with torch.no_grad():
@@ -238,6 +245,7 @@ class CriticModelActor(BaseModelActor):
                 values_allgather=True,
             )
         self.critic.train()  # reset model state
+        tp.end()
         return value.to("cpu")
 
     def append(self, experience):
@@ -246,12 +254,15 @@ class CriticModelActor(BaseModelActor):
 
     def fit(self):
         """Train critic model with the replay buffer."""
+        tp = TracePoint("train-critic-model", "1")
+        tp.begin()
         torch.cuda.empty_cache()
         self.critic.train()
         status = self.trainer.ppo_train()
         self.trainer.replay_buffer.clear()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        tp.end()
         return status
 
     def save_model(self):

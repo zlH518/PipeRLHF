@@ -1,3 +1,14 @@
+ray stop --force
+pkill -9 ray
+pkill -9 python
+sleep 3
+pkill -9 ray
+pkill -9 python
+
+set -ex
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+ray start --head --node-ip-address "127.0.0.1" --num-gpus 4
 
 
 python3 -m openrlhf.cli.train_ppo_ray \
@@ -18,12 +29,12 @@ python3 -m openrlhf.cli.train_ppo_ray \
 --save_path /workspace/PipeRLHF/experiments/final/qwen3-06b-rlhf \
 --ckpt_path /workspace/PipeRLHF/experiments/ckpt/qwen3-06b-rlhf \
 --save_hf_ckpt \
---micro_train_batch_size 4 \
---train_batch_size 4 \
---micro_rollout_batch_size 4 \
+--micro_train_batch_size 8 \
+--train_batch_size 8 \
+--micro_rollout_batch_size 16 \
 --rollout_batch_size 2 \
---n_samples_per_prompt 2 \
---max_samples 2 \
+--n_samples_per_prompt 8 \
+--max_samples 32 \
 --max_epochs 1 \
 --prompt_max_len 1024 \
 --generate_max_len 1024 \

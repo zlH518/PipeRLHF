@@ -244,6 +244,7 @@ class SamplesGenerator:
         self.vllm_engines = vllm_engines
         self.tokenizer = tokenizer
         self.prompt_max_len = prompt_max_len
+        tracepoint_module_setup()
 
     @torch.no_grad()
     async def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Experience]:
@@ -253,7 +254,6 @@ class SamplesGenerator:
         When not using vllm, we will fallback to the default implementation,
         in which actor will be used to generate samples.
         """
-        tracepoint_module_setup()
         # vLLM wakeup when vllm_enable_sleep
         if self.strategy.args.vllm_enable_sleep:
             wake_up_tp = TracePoint("wake up vllm", "1")
@@ -309,7 +309,6 @@ class SamplesGenerator:
         """
         from vllm import SamplingParams
         from tracer import tracepoint_module_setup, TracePoint
-        tracepoint_module_setup()
         tp = TracePoint("pre-processing data", "1")
         tp.begin()
         llms = self.vllm_engines
@@ -458,6 +457,7 @@ class RemoteExperienceMaker(ABC):
         self.remote_rm_url = self.args.remote_rm_url
         self.remote_reward_model = remote_reward_model
         self.tokenizer = tokenizer
+        tracepoint_module_setup()
 
     @torch.no_grad()
     async def make_experience_batch(self, rollout_samples) -> List[Experience]:
@@ -472,7 +472,6 @@ class RemoteExperienceMaker(ABC):
         # Each batch of samples will be scheduled to a effective Ray Actor (i.e, a DP rank)
         # TODO: balance the number of tokens of each batch for better performance
         from tracer import TracePoint, tracepoint_module_setup
-        tracepoint_module_setup()
         tp = TracePoint("pre-processing-data", "1")
         tp.begin()
         samples_list = []
@@ -500,7 +499,8 @@ class RemoteExperienceMaker(ABC):
         Turn samples into experience by calculating logprobs, values, rewards, and kl divergence.
         """
         from tracer import TracePoint, tracepoint_module_setup
-        tracepoint_module_setup()
+        tp = TracePoint("pre-process-make-experience", "1")
+        tp.begin()
         start_time = time.time()
         logger.info(f"🚀 Starting experience making with {len(samples_list[0].sequences) * len(samples_list)} samples")
 
@@ -513,6 +513,7 @@ class RemoteExperienceMaker(ABC):
         attention_mask_list = [s.attention_mask for s in samples_list]
         action_mask_list = [s.action_mask for s in samples_list]
 
+        tp.end()
         # The rewards are already filled in the samples_list, such as the agent's environment rewards
         if samples_list[0].rewards is not None:
             pass

@@ -22,6 +22,8 @@ from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, r
 from openrlhf.utils.distributed_util import init_process_group, torch_dist_barrier_and_cuda_sync
 from openrlhf.utils.logging_utils import init_logger
 
+from tracer import tracepoint_module_setup, TracePoint
+
 from ..ppo_utils import NaiveReplayBuffer
 
 logger = init_logger(__name__)
@@ -358,6 +360,7 @@ class ActorPPOTrainer(ABC):
 @ray.remote(num_gpus=1)
 class PolicyModelActor(BaseModelActor):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, max_steps=None, vllm_engines=None):
+        
         args = strategy.args
         self.save_hf_ckpt = args.save_hf_ckpt
         self.disable_ds_ckpt = args.disable_ds_ckpt
@@ -371,6 +374,7 @@ class PolicyModelActor(BaseModelActor):
                 os.environ["NCCL_CUMEM_ENABLE"] = "0"
 
         self._setup_distributed(strategy)
+        print(f"policy model global rank: {os.getenv("GLOBAL_RANK")}")
 
         actor = Actor(
             pretrain,
@@ -465,12 +469,15 @@ class PolicyModelActor(BaseModelActor):
 
     def fit(self, kl_ctl: float = 0):
         """Train actor model with the replay buffer."""
+        tp = TracePoint("train-actor-model", "1")
+        tp.begin()
         torch.cuda.empty_cache()
         self.actor.train()
         status = self.trainer.ppo_train(kl_ctl)
         self.trainer.replay_buffer.clear()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+        tp.end()
         return status
 
     def save_model(self):
@@ -491,6 +498,8 @@ class PolicyModelActor(BaseModelActor):
         packed_seq_lens=None,
     ) -> torch.Tensor:
         """Generates actor values."""
+        tp = TracePoint("actor-model-forward", "1")
+        tp.begin()
         device = torch.cuda.current_device()
         self.actor.eval()
         with torch.no_grad():
@@ -501,10 +510,14 @@ class PolicyModelActor(BaseModelActor):
                 ring_attn_group=self.strategy.ring_attn_group,
             )
         self.actor.train()  # reset model state
+        tp.end()
         return action_log_probs.to("cpu")
 
     def broadcast_to_vllm(self):
+        tp = TracePoint("broadcate-weight-to-vllm", "1")
+        tp.begin()
         self.trainer._broadcast_to_vllm()
+        tp.end()
 
     def get_checkpoint_states(self):
         return self.checkpoint_states
