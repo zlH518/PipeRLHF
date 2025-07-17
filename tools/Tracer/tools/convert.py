@@ -17,13 +17,13 @@ parser.add_argument(
     "--input-file",
     help="Input log file path (e.g., rank_0.log)",
     type=str,
-    default = "/workspace/PipeRLHF/experiments/hands_log/TracePoint"
+    default = "/root/data/experiments/log/TracePoint"
 )
 parser.add_argument(
     "--output-file",
     help="Output JSON file path (e.g., trace.json)",
     type=str,
-    default = "/workspace/PipeRLHF/experiments/hands_json/demo.json"
+    default = "/root/data/experiments/json/717"
 )
 parser.add_argument(
     "--min-time",

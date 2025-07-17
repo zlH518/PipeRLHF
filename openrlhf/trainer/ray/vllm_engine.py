@@ -38,7 +38,6 @@ class BaseLLMRayActor:
             # when the distributed_executor_backend is not ray and
             # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set.
             os.environ["CUDA_VISIBLE_DEVICES"] = str(ray.get_gpu_ids()[0])
-        os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
         num_gpus = kwargs.pop("num_gpus")
         if bundle_indices is not None:
             os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
@@ -186,7 +185,7 @@ def create_vllm_engines(
                 num_gpus=0.2 if use_hybrid_engine else 1,
                 enable_sleep_mode=vllm_enable_sleep,
                 agent_func_path=agent_func_path,
-                offset=offset,
+                offset=offset+i,
             )
         )
 

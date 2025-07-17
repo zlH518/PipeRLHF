@@ -7,6 +7,7 @@ pkill -9 python
 
 set -ex
 
+
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 ray start --head --node-ip-address "127.0.0.1" --num-gpus 4
 
@@ -24,17 +25,17 @@ python3 -m openrlhf.cli.train_ppo_ray \
 --vllm_tensor_parallel_size 1 \
 --vllm_gpu_memory_utilization 0.8 \
 --advantage_estimator group_norm \
---pretrain /workspace/models/HF/Qwen3-0.6B \
---reward_pretrain /workspace/models/HF/Qwen3-0.6B \
---save_path /workspace/PipeRLHF/experiments/final/qwen3-06b-rlhf \
---ckpt_path /workspace/PipeRLHF/experiments/ckpt/qwen3-06b-rlhf \
+--pretrain /volume/pt-train/models/Qwen3-4B \
+--reward_pretrain /volume/pt-train/models/Qwen3-4B \
+--save_path /root/data/experiments/final/qwen3-4b-rlhf \
+--ckpt_path /root/data/experiments/ckpt/qwen3-4b-rlhf \
 --save_hf_ckpt \
---micro_train_batch_size 8 \
---train_batch_size 8 \
+--micro_train_batch_size 16 \
+--train_batch_size 16 \
 --micro_rollout_batch_size 16 \
 --rollout_batch_size 2 \
 --n_samples_per_prompt 8 \
---max_samples 32 \
+--max_samples 128 \
 --max_epochs 1 \
 --prompt_max_len 1024 \
 --generate_max_len 1024 \
@@ -43,7 +44,7 @@ python3 -m openrlhf.cli.train_ppo_ray \
 --actor_learning_rate 5e-7 \
 --critic_learning_rate 9e-6 \
 --init_kl_coef 1e-3 \
---prompt_data /workspace/data/PipeRLHF/gsm8k/train.parquet \
+--prompt_data /root/data/gsm8k/train.parquet \
 --input_key prompt \
 --apply_chat_template \
 --normalize_reward \
